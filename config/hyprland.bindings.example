@@ -1,0 +1,22 @@
+# crate keybindings for Hyprland — Omarchy-friendly defaults.
+# These avoid existing Omarchy bindings (SUPER SHIFT M = Spotify launcher,
+# SUPER SHIFT N = editor, SUPER C = universal-copy, SUPER P/S = tiling).
+#
+# Copy to ~/.config/crate/hyprland.bindings, then add to ~/.config/hypr/bindings.conf:
+#   source = ~/.config/crate/hyprland.bindings
+
+# Playback (top-level SUPER for the most-used; SUPER ALT for rest)
+bind = SUPER, M, exec, crate play
+bind = SUPER, N, exec, crate next
+bind = SUPER ALT, M, exec, crate pause
+bind = SUPER ALT, P, exec, crate prev
+bind = SUPER ALT, S, exec, crate skip          # current → .trash/
+bind = SUPER ALT, F, exec, crate fav           # mark as favorite (LLM bias)
+
+# Switch active crate (walker/wofi/rofi picker)
+bind = SUPER ALT, C, exec, crate switch
+
+# Media keys (universal)
+bindl = , XF86AudioPlay, exec, crate pause
+bindl = , XF86AudioNext, exec, crate next
+bindl = , XF86AudioPrev, exec, crate prev

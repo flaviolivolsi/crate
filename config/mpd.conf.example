@@ -1,0 +1,34 @@
+# Minimal mpd config for crate.
+# Copy to ~/.config/mpd/mpd.conf, then:
+#   systemctl --user enable --now mpd
+
+music_directory     "~/Audio/crate"
+playlist_directory  "~/.local/share/mpd/playlists"
+db_file             "~/.local/share/mpd/database"
+log_file            "~/.local/share/mpd/log"
+state_file          "~/.local/share/mpd/state"
+sticker_file        "~/.local/share/mpd/sticker.sql"
+
+# bind to localhost only — no network exposure
+bind_to_address     "127.0.0.1"
+port                "6600"
+
+# autoupdate library when files change
+auto_update         "yes"
+
+audio_output {
+    type    "pipewire"
+    name    "PipeWire Sound Server"
+}
+
+# fallback if PipeWire isn't your audio stack
+# audio_output {
+#     type    "pulse"
+#     name    "PulseAudio"
+# }
+
+# ALSA fallback
+# audio_output {
+#     type    "alsa"
+#     name    "Default ALSA"
+# }

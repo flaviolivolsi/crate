@@ -1,0 +1,12 @@
+# crate config — copy to ~/.config/crate/crate.toml and edit.
+# All sections optional; reasonable defaults apply when omitted.
+
+[paths]
+# Where crates live. Default: ~/Audio/crate
+# root = "~/Audio/crate"
+
+[llm]
+# Auto-detected from env if omitted (ANTHROPIC_API_KEY → GEMINI_API_KEY → OPENAI_API_KEY).
+# Set explicitly to override.
+# provider = "anthropic"           # "anthropic" | "gemini" | "openai"
+# model    = "claude-sonnet-4-6"   # provider-specific model id

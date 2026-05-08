@@ -1,0 +1,14 @@
+# crate keybindings for Sway.
+# Add to ~/.config/sway/config (or include from a separate file):
+
+bindsym $mod+m              exec crate play
+bindsym $mod+Shift+m        exec crate pause
+bindsym $mod+Shift+n        exec crate next
+bindsym $mod+Shift+p        exec crate prev
+bindsym $mod+Shift+s        exec crate skip
+bindsym $mod+Shift+f        exec crate fav
+bindsym $mod+c              exec crate switch
+
+bindsym XF86AudioPlay       exec crate pause
+bindsym XF86AudioNext       exec crate next
+bindsym XF86AudioPrev       exec crate prev

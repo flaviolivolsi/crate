@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""crate — personal audio crates curated by an LLM."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG_PATH = Path(os.environ.get("CRATE_CONFIG", "~/.config/crate/crate.toml")).expanduser()
+DEFAULT_ROOT = Path("~/Audio/crate").expanduser()
+DEFAULT_COUNT = 20
+
+# ─── config ────────────────────────────────────────────────────────────────
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        with CONFIG_PATH.open("rb") as f:
+            return tomllib.load(f)
+    return {}
+
+
+def root_dir(cfg: dict) -> Path:
+    return Path(cfg.get("paths", {}).get("root", DEFAULT_ROOT)).expanduser()
+
+
+def state_path(cfg: dict) -> Path:
+    return root_dir(cfg) / ".state.json"
+
+
+def read_state(cfg: dict) -> dict:
+    p = state_path(cfg)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {}
+
+
+def write_state(cfg: dict, state: dict) -> None:
+    p = state_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2))
+
+
+# ─── crate metadata ────────────────────────────────────────────────────────
+
+
+def crate_dir(cfg: dict, name: str) -> Path:
+    return root_dir(cfg) / name
+
+
+def crate_meta_path(cfg: dict, name: str) -> Path:
+    return crate_dir(cfg, name) / ".crate.json"
+
+
+def read_crate_meta(cfg: dict, name: str) -> dict:
+    p = crate_meta_path(cfg, name)
+    if not p.exists():
+        die(f"crate '{name}' not found at {crate_dir(cfg, name)}")
+    return json.loads(p.read_text())
+
+
+def write_crate_meta(cfg: dict, name: str, meta: dict) -> None:
+    meta["updated"] = datetime.now(timezone.utc).isoformat()
+    crate_meta_path(cfg, name).write_text(json.dumps(meta, indent=2))
+
+
+def list_crates(cfg: dict) -> list[str]:
+    root = root_dir(cfg)
+    if not root.exists():
+        return []
+    return sorted(
+        d.name for d in root.iterdir() if d.is_dir() and (d / ".crate.json").exists()
+    )
+
+
+def list_tracks(cfg: dict, name: str) -> list[str]:
+    """Audio filenames (no extension) in the crate."""
+    d = crate_dir(cfg, name)
+    if not d.exists():
+        return []
+    out = []
+    for f in d.iterdir():
+        if f.is_file() and f.suffix.lower() in {".mp3", ".m4a", ".opus", ".webm", ".flac"}:
+            out.append(f.stem)
+    return sorted(out)
+
+
+def list_trash(cfg: dict, name: str) -> list[str]:
+    d = crate_dir(cfg, name) / ".trash"
+    if not d.exists():
+        return []
+    return sorted(f.stem for f in d.iterdir() if f.is_file())
+
+
+def favorites_path(cfg: dict, name: str) -> Path:
+    return crate_dir(cfg, name) / ".favorites"
+
+
+def list_favorites(cfg: dict, name: str) -> list[str]:
+    p = favorites_path(cfg, name)
+    if not p.exists():
+        return []
+    return [line.strip() for line in p.read_text().splitlines() if line.strip()]
+
+
+def write_favorites(cfg: dict, name: str, favs: list[str]) -> None:
+    p = favorites_path(cfg, name)
+    p.write_text("\n".join(favs) + ("\n" if favs else ""))
+
+
+# ─── LLM ───────────────────────────────────────────────────────────────────
+
+
+def llm_provider(cfg: dict) -> tuple[str, str]:
+    """Returns (provider, model). Detects from config or env."""
+    llm_cfg = cfg.get("llm", {})
+    provider = llm_cfg.get("provider")
+    model = llm_cfg.get("model")
+    if provider:
+        return provider, model or _default_model(provider)
+    # auto-detect
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic", model or "claude-sonnet-4-6"
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini", model or "gemini-2.5-flash"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai", model or "gpt-4o-mini"
+    die("no LLM provider configured. Set ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY.")
+
+
+def _default_model(provider: str) -> str:
+    return {
+        "anthropic": "claude-sonnet-4-6",
+        "gemini": "gemini-2.5-flash",
+        "openai": "gpt-4o-mini",
+    }.get(provider, "claude-sonnet-4-6")
+
+
+SYSTEM_PROMPT = """You are a music curator. The user maintains a curated audio library called a "crate" with a stated purpose. They want you to suggest specific tracks (or podcast episodes) that match the crate description, without repeating tracks already in the library or rejected.
+
+Output rules:
+- Output exactly the requested number of lines.
+- Each line: "Artist — Title" (em-dash, but a regular hyphen is fine too).
+- For podcasts: "Show — Episode Title" works.
+- No numbering, no commentary, no markdown, no explanation.
+- Tracks must be real and findable on YouTube.
+- If the description specifies "instrumental" or "no vocals", recommend ONLY instrumental tracks.
+- Vary artists/labels — don't recommend 10 tracks from the same artist."""
+
+
+def llm_suggest(
+    description: str,
+    library: list[str],
+    trash: list[str],
+    favorites: list[str],
+    count: int,
+    provider: str,
+    model: str,
+) -> list[str]:
+    fav_block = ""
+    if favorites:
+        fav_block = f"""
+
+User's favorites in this crate (POSITIVE signal — lean toward similar style, artists, labels, era):
+{chr(10).join(f"- {t}" for t in favorites)}"""
+    user_msg = f"""Crate description:
+{description}
+
+Already in this crate (do not repeat):
+{chr(10).join(f"- {t}" for t in library) if library else "(empty)"}
+
+Previously rejected by user (do not suggest):
+{chr(10).join(f"- {t}" for t in trash) if trash else "(none)"}{fav_block}
+
+Suggest {count} new tracks matching the description, avoiding both lists."""
+    if provider == "anthropic":
+        text = _call_anthropic(model, SYSTEM_PROMPT, user_msg)
+    elif provider == "gemini":
+        text = _call_gemini(model, SYSTEM_PROMPT, user_msg)
+    elif provider == "openai":
+        text = _call_openai(model, SYSTEM_PROMPT, user_msg)
+    else:
+        die(f"unknown provider: {provider}")
+    return _parse_tracklist(text)
+
+
+def _parse_tracklist(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # strip leading numbering like "1. " or "1) "
+        line = re.sub(r"^\s*\d+[\.\)]\s+", "", line)
+        # strip leading bullets
+        line = re.sub(r"^[-*]\s+", "", line)
+        # require a separator that looks like a track line
+        if " — " in line or " - " in line or " – " in line:
+            lines.append(line)
+    return lines
+
+
+def _http_post_json(url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        die(f"HTTP {e.code} from LLM API:\n{body}")
+    except urllib.error.URLError as e:
+        die(f"network error calling LLM API: {e.reason}")
+
+
+def _call_anthropic(model: str, system: str, user: str) -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY") or die("ANTHROPIC_API_KEY not set")
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    data = _http_post_json("https://api.anthropic.com/v1/messages", headers, payload)
+    return data["content"][0]["text"]
+
+
+def _call_gemini(model: str, system: str, user: str) -> str:
+    key = os.environ.get("GEMINI_API_KEY") or die("GEMINI_API_KEY not set")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    payload = {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "generationConfig": {
+            "temperature": 0.8,
+            "maxOutputTokens": 8192,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    headers = {"content-type": "application/json"}
+    data = _http_post_json(url, headers, payload)
+    if os.environ.get("CRATE_DEBUG"):
+        print(f"[debug] gemini response: {json.dumps(data, indent=2)[:2000]}", file=sys.stderr)
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        die(f"unexpected Gemini response shape:\n{json.dumps(data, indent=2)[:1500]}")
+
+
+def _call_openai(model: str, system: str, user: str) -> str:
+    key = os.environ.get("OPENAI_API_KEY") or die("OPENAI_API_KEY not set")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    headers = {"authorization": f"Bearer {key}", "content-type": "application/json"}
+    data = _http_post_json("https://api.openai.com/v1/chat/completions", headers, payload)
+    return data["choices"][0]["message"]["content"]
+
+
+# ─── yt-dlp ────────────────────────────────────────────────────────────────
+
+
+def _safe_filename(s: str) -> str:
+    s = re.sub(r"[/\\:?*<>|\"\x00-\x1f]", "_", s)
+    s = s.strip(". ")
+    return s[:180] if len(s) > 180 else s
+
+
+def ytdlp_search_download(query: str, dest_dir: Path, target_name: str | None = None) -> Path | None:
+    """Search YouTube for query, download top hit as audio. Returns filepath or None."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if target_name:
+        safe = _safe_filename(target_name)
+        output_template = str(dest_dir / f"{safe}.%(ext)s")
+    else:
+        output_template = str(dest_dir / "%(uploader)s - %(title)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        f"ytsearch1:{query}",
+        "--no-playlist",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--embed-metadata",
+        "--match-filter", "duration > 60 & duration < 1800",
+        "-o", output_template,
+        "--print", "after_move:filepath",
+        "--no-progress",
+        "--quiet",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        return None
+    out = result.stdout.strip()
+    if result.returncode == 0 and out:
+        path = Path(out.splitlines()[-1].strip())
+        if path.exists():
+            return path
+    return None
+
+
+# ─── mpc ───────────────────────────────────────────────────────────────────
+
+
+def mpc(*args: str, capture: bool = False) -> str:
+    """Run mpc. By default silences mpc's chatty post-action status output;
+    pass capture=True when you actually need stdout."""
+    cmd = ["mpc", *args]
+    try:
+        if capture:
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            return r.stdout
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return ""
+    except FileNotFoundError:
+        die("mpc not found. Install with: sudo pacman -S mpc")
+
+
+def mpd_running() -> bool:
+    try:
+        r = subprocess.run(
+            ["mpc", "status"], capture_output=True, text=True, timeout=5
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def mpc_load_dir(rel_path: str, shuffle: bool = True) -> None:
+    """Clear queue, add a directory (relative to mpd music_directory), play."""
+    mpc("clear")
+    mpc("ls", rel_path)  # ensure mpd knows about it
+    mpc("update", "--wait", rel_path)
+    mpc("add", rel_path)
+    if shuffle:
+        mpc("shuffle")
+    mpc("play")
+
+
+# ─── commands ──────────────────────────────────────────────────────────────
+
+
+def cmd_new(args, cfg: dict) -> None:
+    name = args.name
+    d = crate_dir(cfg, name)
+    if d.exists() and (d / ".crate.json").exists():
+        die(f"crate '{name}' already exists at {d}")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ".trash").mkdir(exist_ok=True)
+    description = args.description
+    if not description:
+        print(f"Describe the vibe of '{name}' (one paragraph; e.g. 'deep melodic techno, instrumental, ~122bpm, like Tale of Us'):")
+        description = input("> ").strip()
+        if not description:
+            die("description cannot be empty")
+    provider, model = llm_provider(cfg)
+    meta = {
+        "name": name,
+        "description": description,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "llm_provider": provider,
+        "llm_model": model,
+    }
+    write_crate_meta(cfg, name, meta)
+    state = read_state(cfg)
+    if not state.get("active"):
+        state["active"] = name
+        write_state(cfg, state)
+    print(f"Created crate '{name}' at {d}")
+    print(f"Active crate: {state.get('active')}")
+    print(f"Run: crate add {name}")
+
+
+def cmd_add(args, cfg: dict) -> None:
+    name = args.name or active_crate(cfg)
+    meta = read_crate_meta(cfg, name)
+    description = args.prose or meta["description"]
+    count = args.count
+    library = list_tracks(cfg, name)
+    trash = list_trash(cfg, name)
+    favorites = list_favorites(cfg, name)
+    provider, model = llm_provider(cfg)
+    fav_note = f" (biasing toward {len(favorites)} favorite{'s' if len(favorites) != 1 else ''})" if favorites else ""
+    print(f"asking {provider}/{model} for {count} suggestions{fav_note}...")
+    suggestions = llm_suggest(description, library, trash, favorites, count, provider, model)
+    if not suggestions:
+        die("LLM returned no parseable suggestions (try --count <smaller> or set CRATE_DEBUG=1)")
+    print(f"got {len(suggestions)} suggestions, downloading...")
+    dest = crate_dir(cfg, name)
+    success = 0
+    failures = []
+    existing = set(list_tracks(cfg, name)) | set(list_trash(cfg, name))
+    for i, line in enumerate(suggestions, 1):
+        sys.stdout.write(f"  [{i}/{len(suggestions)}] {line[:70]}... ")
+        sys.stdout.flush()
+        if _safe_filename(line) in existing:
+            print("⊙ already in library/trash, skipping")
+            continue
+        path = ytdlp_search_download(line + " official audio", dest, target_name=line)
+        if path:
+            print(f"✓")
+            success += 1
+        else:
+            print("✗ no match")
+            failures.append(line)
+    print(f"\nadded {success}/{len(suggestions)} tracks to {name}")
+    if failures:
+        print(f"failed: {len(failures)} (likely hallucinations or unavailable)")
+    if mpd_running():
+        mpc("update", "--wait", name)
+    write_crate_meta(cfg, name, meta)
+
+
+def active_crate(cfg: dict) -> str:
+    state = read_state(cfg)
+    name = state.get("active")
+    if not name:
+        crates = list_crates(cfg)
+        if len(crates) == 1:
+            return crates[0]
+        die("no active crate. Run: crate use <name>")
+    return name
+
+
+def cmd_play(args, cfg: dict) -> None:
+    name = args.name or active_crate(cfg)
+    if name not in list_crates(cfg):
+        die(f"crate '{name}' not found")
+    if not mpd_running():
+        die("mpd not running. Start with: systemctl --user start mpd")
+    state = read_state(cfg)
+    state["active"] = name
+    write_state(cfg, state)
+    mpc_load_dir(name, shuffle=True)
+    cur = mpc("current", capture=True).strip()
+    print(f"▶  [{name}]  {cur}" if cur else f"▶  [{name}]  (loading…)")
+
+
+def cmd_skip(args, cfg: dict) -> None:
+    if not mpd_running():
+        die("mpd not running")
+    current = mpc("current", "--format", "%file%", capture=True).strip()
+    if not current:
+        die("no track playing")
+    name = active_crate(cfg)
+    crate_root = crate_dir(cfg, name)
+    src = root_dir(cfg) / current
+    if not src.exists():
+        die(f"current track file not found: {src}")
+    trash_dir = crate_root / ".trash"
+    trash_dir.mkdir(exist_ok=True)
+    dest = trash_dir / src.name
+    shutil.move(str(src), str(dest))
+    mpc("update", "--wait", name)
+    mpc("next")
+    nxt = mpc("current", capture=True).strip()
+    print(f"✗  skipped: {src.stem}  →  .trash/")
+    if nxt:
+        print(f"▶  next:    {nxt}")
+
+
+def _current_track_stem(cfg: dict) -> tuple[str, str]:
+    """Returns (active_crate, current_filename_stem). Dies if nothing playing."""
+    if not mpd_running():
+        die("mpd not running")
+    current = mpc("current", "--format", "%file%", capture=True).strip()
+    if not current:
+        die("no track playing")
+    name = active_crate(cfg)
+    src = root_dir(cfg) / current
+    if not src.exists():
+        die(f"current track file not found: {src}")
+    return name, src.stem
+
+
+def cmd_fav(args, cfg: dict) -> None:
+    name, stem = _current_track_stem(cfg)
+    favs = list_favorites(cfg, name)
+    if stem in favs:
+        print(f"★ already favorited: {stem}")
+        return
+    favs.append(stem)
+    write_favorites(cfg, name, favs)
+    print(f"★ favorited: {stem}")
+
+
+def cmd_unfav(args, cfg: dict) -> None:
+    name, stem = _current_track_stem(cfg)
+    favs = list_favorites(cfg, name)
+    if stem not in favs:
+        print(f"not in favorites: {stem}")
+        return
+    favs.remove(stem)
+    write_favorites(cfg, name, favs)
+    print(f"☆ unfavorited: {stem}")
+
+
+def cmd_passthrough(verb: str):
+    """Run an mpc verb and report what's playing now in our own voice."""
+    def f(args, cfg: dict) -> None:
+        if not mpd_running():
+            die("mpd not running")
+        mpc(verb)
+        cur = mpc("current", capture=True).strip()
+        state = mpc("status", capture=True).strip()
+        is_paused = "[paused]" in state
+        is_playing = "[playing]" in state
+        glyph = {"next": "▶ ", "prev": "▶ ", "toggle": "⏸ " if is_paused else "▶ ", "stop": "⏹ "}.get(verb, "·  ")
+        if not cur:
+            print(f"{glyph} (stopped)")
+        elif is_paused:
+            print(f"⏸  {cur}")
+        elif is_playing:
+            print(f"{glyph} {cur}")
+        else:
+            print(f"{glyph} {cur}")
+    return f
+
+
+def cmd_use(args, cfg: dict) -> None:
+    name = args.name
+    if name not in list_crates(cfg):
+        die(f"crate '{name}' not found")
+    state = read_state(cfg)
+    state["active"] = name
+    write_state(cfg, state)
+    print(f"active crate: {name}")
+
+
+def cmd_switch(args, cfg: dict) -> None:
+    crates = list_crates(cfg)
+    if not crates:
+        die("no crates exist. Run: crate new <name>")
+    picker = pick_picker()
+    choice = run_picker(picker, crates, prompt="crate:")
+    if not choice:
+        return
+    state = read_state(cfg)
+    state["active"] = choice
+    write_state(cfg, state)
+    if mpd_running():
+        mpc_load_dir(choice, shuffle=True)
+        cur = mpc("current", capture=True).strip()
+        print(f"▶  [{choice}]  {cur}" if cur else f"▶  [{choice}]  (loading…)")
+    else:
+        print(f"·  active: {choice}")
+
+
+def pick_picker() -> str:
+    for tool in ("walker", "wofi", "rofi", "fzf"):
+        if shutil.which(tool):
+            return tool
+    die("no picker found (need walker, wofi, rofi, or fzf)")
+
+
+def run_picker(picker: str, items: list[str], prompt: str = "") -> str | None:
+    inp = "\n".join(items)
+    if picker == "walker":
+        cmd = ["walker", "--dmenu", "-p", prompt]
+    elif picker == "wofi":
+        cmd = ["wofi", "--dmenu", "-p", prompt]
+    elif picker == "rofi":
+        cmd = ["rofi", "-dmenu", "-p", prompt]
+    elif picker == "fzf":
+        cmd = ["fzf", "--prompt", prompt + " "]
+    else:
+        return None
+    r = subprocess.run(cmd, input=inp, capture_output=True, text=True)
+    out = r.stdout.strip()
+    return out or None
+
+
+def cmd_list(args, cfg: dict) -> None:
+    crates = list_crates(cfg)
+    if not crates:
+        print("no crates yet. run: crate new <name>")
+        return
+    state = read_state(cfg)
+    active = state.get("active", "")
+    for name in crates:
+        marker = "*" if name == active else " "
+        n = len(list_tracks(cfg, name))
+        t = len(list_trash(cfg, name))
+        f = len(list_favorites(cfg, name))
+        meta = read_crate_meta(cfg, name)
+        desc = meta.get("description", "")[:55]
+        print(f"  {marker} {name:<14} {n:>4} tracks  ({f}★, {t} trashed)  — {desc}")
+
+
+def cmd_now(args, cfg: dict) -> None:
+    if not mpd_running():
+        print("⏹  (mpd not running)")
+        return
+    name = active_crate(cfg)
+    cur = mpc("current", capture=True).strip()
+    cur_file = mpc("current", "--format", "%file%", capture=True).strip()
+    state = mpc("status", capture=True)
+    is_paused = "[paused]" in state
+    glyph = "⏸ " if is_paused else ("▶ " if cur else "⏹ ")
+    if cur:
+        stem = Path(cur_file).stem if cur_file else ""
+        star = "★ " if stem and stem in list_favorites(cfg, name) else ""
+        print(f"{glyph} [{name}]  {star}{cur}")
+    else:
+        print(f"{glyph} [{name}]  (stopped)")
+
+
+def cmd_doctor(args, cfg: dict) -> None:
+    checks = []
+    checks.append(("python3", shutil.which("python3") is not None))
+    checks.append(("yt-dlp", shutil.which("yt-dlp") is not None))
+    checks.append(("mpd", shutil.which("mpd") is not None))
+    checks.append(("mpc", shutil.which("mpc") is not None))
+    checks.append(("mpd running", mpd_running()))
+    try:
+        provider, model = llm_provider(cfg)
+        checks.append((f"LLM: {provider}/{model}", True))
+    except SystemExit:
+        checks.append(("LLM provider", False))
+    root = root_dir(cfg)
+    checks.append((f"audio root: {root}", root.exists() or root.parent.exists()))
+    picker_ok = any(shutil.which(p) for p in ("walker", "wofi", "rofi", "fzf"))
+    checks.append(("picker (walker/wofi/rofi/fzf)", picker_ok))
+    print(f"config: {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'using defaults'})")
+    print()
+    all_ok = True
+    for label, ok in checks:
+        mark = "✓" if ok else "✗"
+        print(f"  {mark} {label}")
+        if not ok:
+            all_ok = False
+    print()
+    if all_ok:
+        print("all checks passed.")
+    else:
+        print("some checks failed. fix the ✗ items above.")
+        sys.exit(1)
+
+
+# ─── helpers ───────────────────────────────────────────────────────────────
+
+
+def die(msg: str) -> None:
+    print(f"crate: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ─── main ──────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="crate", description="personal audio crates")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("new", help="create a new crate")
+    sp.add_argument("name")
+    sp.add_argument("--description", "-d", help="prose description (prompted if omitted)")
+    sp.set_defaults(func=cmd_new)
+
+    sp = sub.add_parser("add", help="ask LLM for tracks and download them")
+    sp.add_argument("name", nargs="?", help="crate name (defaults to active)")
+    sp.add_argument("prose", nargs="?", help="optional prose to refine this batch")
+    sp.add_argument("--count", "-n", type=int, default=DEFAULT_COUNT)
+    sp.set_defaults(func=cmd_add)
+
+    sp = sub.add_parser("play", help="play a crate (defaults to active)")
+    sp.add_argument("name", nargs="?")
+    sp.set_defaults(func=cmd_play)
+
+    sp = sub.add_parser("skip", help="move current track to .trash/ and advance")
+    sp.set_defaults(func=cmd_skip)
+
+    sp = sub.add_parser("fav", help="mark current track as favorite (positive LLM signal)")
+    sp.set_defaults(func=cmd_fav)
+
+    sp = sub.add_parser("unfav", help="remove current track from favorites")
+    sp.set_defaults(func=cmd_unfav)
+
+    for verb in ("next", "prev", "pause", "stop"):
+        sp = sub.add_parser(verb, help=f"mpc {verb}")
+        sp.set_defaults(func=cmd_passthrough("toggle" if verb == "pause" else verb))
+
+    sp = sub.add_parser("use", help="set active crate")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_use)
+
+    sp = sub.add_parser("switch", help="picker → set active crate + play")
+    sp.set_defaults(func=cmd_switch)
+
+    sp = sub.add_parser("list", help="list all crates")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("now", help="current track")
+    sp.set_defaults(func=cmd_now)
+
+    sp = sub.add_parser("doctor", help="check deps + config")
+    sp.set_defaults(func=cmd_doctor)
+
+    args = p.parse_args()
+    cfg = load_config()
+    args.func(args, cfg)
+
+
+if __name__ == "__main__":
+    main()

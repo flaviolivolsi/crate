@@ -1,0 +1,14 @@
+# crate keybindings for i3.
+# Add to ~/.config/i3/config:
+
+bindsym $mod+m              exec --no-startup-id crate play
+bindsym $mod+Shift+m        exec --no-startup-id crate pause
+bindsym $mod+Shift+n        exec --no-startup-id crate next
+bindsym $mod+Shift+p        exec --no-startup-id crate prev
+bindsym $mod+Shift+s        exec --no-startup-id crate skip
+bindsym $mod+Shift+f        exec --no-startup-id crate fav
+bindsym $mod+c              exec --no-startup-id crate switch
+
+bindsym XF86AudioPlay       exec --no-startup-id crate pause
+bindsym XF86AudioNext       exec --no-startup-id crate next
+bindsym XF86AudioPrev       exec --no-startup-id crate prev

@@ -1,0 +1,32 @@
+# crate keybindings for sxhkd (X11 standalone).
+# Add to ~/.config/sxhkd/sxhkdrc:
+
+super + m
+    crate play
+
+super + shift + m
+    crate pause
+
+super + shift + n
+    crate next
+
+super + shift + p
+    crate prev
+
+super + shift + s
+    crate skip
+
+super + shift + f
+    crate fav
+
+super + c
+    crate switch
+
+XF86AudioPlay
+    crate pause
+
+XF86AudioNext
+    crate next
+
+XF86AudioPrev
+    crate prev

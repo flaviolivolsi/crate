@@ -1,0 +1,12 @@
+{
+  "custom/crate": {
+    "exec": "crate now 2>/dev/null || echo '♪ —'",
+    "interval": 5,
+    "on-click": "crate pause",
+    "on-click-right": "crate switch",
+    "on-scroll-up": "crate next",
+    "on-scroll-down": "crate prev",
+    "tooltip": false,
+    "max-length": 60
+  }
+}
